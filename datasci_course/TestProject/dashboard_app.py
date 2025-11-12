@@ -8,6 +8,16 @@ import altair as alt
 # The database is created by the notebook inside TestProject/, so keep it local to this folder
 DB_PATH = os.path.join(os.path.dirname(__file__), "loan_database.db")
 
+TARGET_METADATA = {
+    "shopping_predictions": {
+        "target": "Subscription Status",
+        "classes": {
+            1: "Yes (Subscribed)",
+            0: "No (Not Subscribed)"
+        }
+    }
+}
+
 @st.cache_resource
 def get_conn(db_path: str):
     return sqlite3.connect(db_path, check_same_thread=False)
@@ -22,6 +32,22 @@ def list_tables(conn: sqlite3.Connection) -> pd.DataFrame:
 
 def get_schema(table: str, conn: sqlite3.Connection) -> pd.DataFrame:
     return read_sql(f"PRAGMA table_info({table})", conn)
+
+def get_columns(table: str, conn: sqlite3.Connection) -> pd.DataFrame:
+    schema = get_schema(table, conn)
+    return schema[["name", "type"]].copy()
+
+def diff_engineered_columns(raw_table: str, fe_table: str, conn: sqlite3.Connection) -> pd.DataFrame:
+    """
+    Return a dataframe listing columns that exist in the feature-engineered table
+    but not in the raw table, along with SQLite inferred types.
+    """
+    raw_cols = get_columns(raw_table, conn)
+    fe_cols = get_columns(fe_table, conn)
+    raw_set = set(raw_cols["name"].tolist())
+    fe_only = fe_cols[~fe_cols["name"].isin(raw_set)].copy()
+    fe_only = fe_only.rename(columns={"name": "feature", "type": "sqlite_type"})
+    return fe_only.sort_values(by="feature").reset_index(drop=True)
 
 def numeric_summary(df: pd.DataFrame) -> pd.DataFrame:
     numeric_cols = df.select_dtypes(include=["int64", "float64"]).columns.tolist()
@@ -100,6 +126,65 @@ def main():
 
     st.markdown("---")
 
+    # Feature Engineering explorer
+    st.subheader("Feature Engineering")
+    if "shopping_data" in ordered and "shopping_data_fe" in ordered:
+        col1, col2 = st.columns(2)
+        with col1:
+            raw_table_sel = st.selectbox(
+                "Raw dataset table",
+                options=[t for t in ordered if t == "shopping_data" or t.endswith("_raw") or t in ("training_data",)],
+                index=0 if "shopping_data" in ordered else 0,
+                key="raw_table_sel"
+            )
+        with col2:
+            fe_table_sel = st.selectbox(
+                "Feature-engineered table",
+                options=[t for t in ordered if t.endswith("_fe") or t == "shopping_data_fe"],
+                index=0,
+                key="fe_table_sel"
+            )
+
+        try:
+            fe_diff = diff_engineered_columns(raw_table_sel, fe_table_sel, conn)
+        except Exception as e:
+            st.error(f"Unable to compare schemas: {e}")
+            fe_diff = pd.DataFrame()
+
+        st.markdown("New engineered columns (present in FE, not in Raw):")
+        if fe_diff.empty:
+            st.info("No new columns detected, or schema comparison failed.")
+        else:
+            st.dataframe(fe_diff, use_container_width=True, hide_index=True)
+
+        # Preview engineered columns only
+        with st.expander("Preview engineered columns", expanded=False):
+            if not fe_diff.empty:
+                engineered_cols = fe_diff["feature"].tolist()
+                preview_query = f"SELECT {', '.join([f'`{c}`' for c in engineered_cols])} FROM {fe_table_sel} LIMIT 200"
+                try:
+                    fe_preview = read_sql(preview_query, conn)
+                except Exception:
+                    # Fallback to select all if any column quoting fails
+                    fe_preview = read_sql(f"SELECT * FROM {fe_table_sel} LIMIT 200", conn)
+                    fe_preview = fe_preview[engineered_cols] if all(c in fe_preview.columns for c in engineered_cols) else fe_preview
+                st.dataframe(fe_preview, use_container_width=True, hide_index=True)
+            else:
+                st.caption("No engineered columns to preview.")
+
+        with st.expander("Schemas (raw vs FE)", expanded=False):
+            left, right = st.columns(2)
+            with left:
+                st.markdown(f"Schema: `{raw_table_sel}`")
+                st.dataframe(get_schema(raw_table_sel, conn), use_container_width=True, hide_index=True)
+            with right:
+                st.markdown(f"Schema: `{fe_table_sel}`")
+                st.dataframe(get_schema(fe_table_sel, conn), use_container_width=True, hide_index=True)
+    else:
+        st.info("Feature-engineered table `shopping_data_fe` not found. Create it in your notebook to enable this view.")
+
+    st.markdown("---")
+
     # Model metrics and predictions (if available)
     st.subheader("Model Metrics and Predictions")
     available_metrics = [t for t in ordered if t.endswith("_metrics")]
@@ -141,43 +226,18 @@ def main():
         preds_table = st.selectbox("Select predictions table", options=available_preds, index=0)
         preds_df = read_sql(f"SELECT * FROM {preds_table}", conn)
         st.markdown(f"**Predictions from `{preds_table}`**")
-        st.dataframe(preds_df.head(100), use_container_width=True, hide_index=True)
+
+        display_df = preds_df.copy()
+        meta = TARGET_METADATA.get(preds_table)
+        if meta and {'pred', 'truth'}.issubset(display_df.columns):
+            label_map = meta.get("classes", {})
+            display_df["pred_label"] = display_df["pred"].map(label_map).fillna(display_df["pred"].astype(str))
+            display_df["truth_label"] = display_df["truth"].map(label_map).fillna(display_df["truth"].astype(str))
+            st.caption(f"Target: **{meta['target']}** — " +
+                       ", ".join(f"{k} = {v}" for k, v in label_map.items()))
+        st.dataframe(display_df.head(100), use_container_width=True, hide_index=True)
     else:
         st.info("No predictions table found (e.g., `shopping_predictions`).")
-
-    # Compare two datasets (basic compare)
-    st.subheader("Compare Two Datasets")
-    left, right = st.columns(2)
-    with left:
-        table_left = st.selectbox("Left dataset", options=[t for t in ordered if t in ("shopping_data", "training_data")], index=0, key="left")
-        df_left = read_sql(f"SELECT * FROM {table_left} LIMIT 1000", conn)
-        st.write(f"Rows: {len(df_left)}, Cols: {len(df_left.columns)}")
-    with right:
-        table_right = st.selectbox("Right dataset", options=[t for t in ordered if t in ("shopping_data", "training_data")], index=1 if "training_data" in ordered else 0, key="right")
-        df_right = read_sql(f"SELECT * FROM {table_right} LIMIT 1000", conn)
-        st.write(f"Rows: {len(df_right)}, Cols: {len(df_right.columns)}")
-
-    # Simple categorical overlap compare (first common categorical column)
-    common_cols = [c for c in df_left.columns if c in df_right.columns]
-    if common_cols:
-        compare_col = st.selectbox("Compare distribution on column", options=common_cols, index=0)
-        if compare_col:
-            def top_counts(df_, col):
-                s = df_[col].astype(str).value_counts().head(10).reset_index()
-                s.columns = [col, "count"]
-                return s
-            lc = top_counts(df_left, compare_col)
-            rc = top_counts(df_right, compare_col)
-            lc["dataset"] = table_left
-            rc["dataset"] = table_right
-            both = pd.concat([lc, rc], ignore_index=True)
-            chart = alt.Chart(both).mark_bar().encode(
-                x=alt.X("count:Q"),
-                y=alt.Y(f"{compare_col}:N", sort='-x'),
-                color="dataset:N",
-                column=alt.Column("dataset:N")
-            ).resolve_scale(y='independent').properties(height=250)
-            st.altair_chart(chart, use_container_width=True)
 
     st.markdown("---")
     st.caption(f"Database: {DB_PATH}")
